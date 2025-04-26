@@ -252,42 +252,92 @@ private:
     }
 };
 
+// Симуляція виконання задачі
+void simulate_task_execution(int task_id, int seconds)
+{
+    {
+        lock_guard<mutex> lock(cout_lock);
+        cout << "Task " << task_id << " is running for " << seconds << "s.\n";
+    }
+    this_thread::sleep_for(chrono::seconds(seconds));
+    {
+        lock_guard<mutex> lock(cout_lock);
+        cout << "Task " << task_id << " is done.\n";
+    }
+}
+
+int get_random_duration(int min, int max)
+{
+    return min + rand() % (max - min + 1);
+}
+
+int get_random_interval(int min, int max)
+{
+    return min + rand() % (max - min + 1);
+}
+
+void stop_after_duration(int seconds)
+{
+    this_thread::sleep_for(chrono::seconds(seconds));
+    stop_simulation = true;
+}
+
 int main()
 {
-    cout << "=== Demonstration of TaskQueue ===\n";
 
-    TaskQueue<TaskWithPriority> queue(5);
+    const int num_workers = 4;
+    const int min_task_duration = 5;
+    const int max_task_duration = 10;
+    const int generation_freq = 2;
+    const int num_generators = 4;
+    const int simulation_seconds = 20;
 
-    for (int i = 5; i >= 1; --i)
-    {
-        TaskWithPriority task{
-            i,
-            [i]() { cout << "Running task with priority " << i << std::endl; }
+    srand(static_cast<unsigned>(time(nullptr)));
+
+    ThreadPool thread_pool;
+    thread_pool.start(num_workers);
+
+    atomic<bool> stop_task_generation(false);
+    auto task_generator = [&]() {
+        while (!stop_task_generation)
+        {
+            int duration = get_random_duration(min_task_duration, max_task_duration);
+            int task_id = task_id_counter.fetch_add(1);
+            thread_pool.submit_task(duration, simulate_task_execution, task_id, duration);
+            int sleep_time = get_random_interval(1, 2) * generation_freq;
+            this_thread::sleep_for(chrono::seconds(sleep_time));
+        }
         };
 
-        if (queue.push_if_possible(task))
-        {
-            cout << "Task with priority " << i << " added.\n";
-        }
-        else
-        {
-            cout << "Task with priority " << i << " rejected (queue full).\n";
-        }
-    }
-
-    cout << "\nExecuting tasks in priority order:\n";
-
-    while (!queue.empty())
+    vector<thread> generators;
+    for (int i = 0; i < num_generators; ++i)
     {
-        TaskWithPriority task;
-        if (queue.pop(task))
-        {
-            if (task.task)
-            {
-                task.task();
-            }
-        }
+        generators.emplace_back(task_generator);
     }
+
+    thread timer_thread(stop_after_duration, simulation_seconds);
+
+    while (!stop_simulation)
+    {
+        this_thread::sleep_for(chrono::milliseconds(100));
+    }
+
+    stop_task_generation = true;
+    thread_pool.shutdown();
+
+    for (auto& t : generators)
+    {
+        if (t.joinable()) t.join();
+    }
+    if (timer_thread.joinable()) timer_thread.join();
+
+    cout << "\n=== Simulation Summary ===\n";
+    cout << "Submitted: " << thread_pool.get_submitted_task_count() << endl;
+    cout << "Completed: " << thread_pool.get_completed_task_count() << endl;
+    cout << "Rejected : " << thread_pool.get_rejected_task_count() << endl;
+    cout << "Avg Wait : " << thread_pool.get_avg_wait_time() << "s\n";
+    cout << "Max Full : " << thread_pool.get_max_queue_full_time() << "ms\n";
+    cout << "Min Full : " << thread_pool.get_min_queue_full_time() << "ms\n";
 
     return 0;
 }
