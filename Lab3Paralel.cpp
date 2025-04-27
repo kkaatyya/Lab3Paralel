@@ -14,24 +14,28 @@
 using namespace std;
 
 // Типи для зручної роботи з блокуванням читання/запису
-using rw_lock_t = std::shared_mutex;
-using shared_read_lock = std::shared_lock<rw_lock_t>;
-using exclusive_write_lock = std::unique_lock<rw_lock_t>;
+using rw_lock_t = shared_mutex;
+using shared_read_lock = shared_lock<rw_lock_t>;
+using exclusive_write_lock = unique_lock<rw_lock_t>;
+
+// Глобальні атомарні прапори
+atomic<bool> stop_simulation(false);
+atomic<int> task_id_counter(0);
+mutex cout_lock;
+
 
 // Структура задачі з пріоритетом
 struct TaskWithPriority
 {
     int priority;
-    function<void()> task;
+    function <void()> task;
 
-    // Менший пріоритет — вища важливість
     bool operator<(const TaskWithPriority& other) const
     {
         return priority > other.priority;
     }
 };
 
-// Шаблонна черга задач з обмеженням розміру
 template <typename TaskType>
 class TaskQueue
 {
@@ -87,7 +91,6 @@ public:
         }
         return false;
     }
-
 private:
     size_t max_size;
     mutable rw_lock_t task_rw_lock;
@@ -101,7 +104,6 @@ public:
     ThreadPool() : task_queue(15) {}
     ~ThreadPool() { shutdown(); }
 
-    // Запуск пулу з вказаною кількістю потоків
     void start(size_t num_threads)
     {
         exclusive_write_lock lock(pool_lock);
@@ -133,6 +135,7 @@ public:
         stopped = false;
     }
 
+    // Додавання задачі до пулу з пріоритетом
     template <typename Func, typename... Args>
     void submit_task(int priority, Func&& func, Args&&... args)
     {
@@ -142,6 +145,7 @@ public:
         }
 
         auto bound_task = bind(forward<Func>(func), forward<Args>(args)...);
+
         TaskWithPriority task{ priority, bound_task };
 
         bool accepted = task_queue.push_if_possible(task);
@@ -151,6 +155,7 @@ public:
             ++total_tasks_submitted;
             task_available.notify_one();
 
+            // Якщо черга переповнилася вперше, запам’ятовуємо час
             if (task_queue.size() == 15 && !queue_full_flag.exchange(true))
             {
                 full_queue_timer_start = chrono::steady_clock::now();
@@ -160,6 +165,7 @@ public:
         {
             ++total_tasks_rejected;
 
+            // Визначаємо тривалість переповнення черги
             if (queue_full_flag.exchange(false))
             {
                 auto full_duration = chrono::duration_cast<chrono::milliseconds>(
@@ -171,6 +177,27 @@ public:
             lock_guard<mutex> lock(cout_lock);
             cout << "Task was rejected due to full queue (priority: " << priority << ").\n";
         }
+    }
+
+    void pause()
+    {
+        exclusive_write_lock lock(pool_lock);
+        if (!stopped)
+        {
+            paused = true;
+        }
+    }
+
+    void resume()
+    {
+        {
+            exclusive_write_lock lock(pool_lock);
+            if (!stopped)
+            {
+                paused = false;
+            }
+        }
+        task_available.notify_all();
     }
 
     size_t get_submitted_task_count() const { return total_tasks_submitted.load(); }
@@ -194,6 +221,7 @@ private:
 
     bool initialized = false;
     bool stopped = false;
+    bool paused = false;
     bool force_exit = false;
 
     atomic<size_t> total_tasks_submitted{ 0 };
@@ -207,8 +235,7 @@ private:
     atomic<bool> queue_full_flag{ false };
     chrono::steady_clock::time_point full_queue_timer_start;
 
-    mutex cout_lock;
-
+    // Цикл роботи одного потоку 
     void worker_loop()
     {
         while (true)
@@ -219,7 +246,7 @@ private:
 
                 auto wait_start = chrono::steady_clock::now();
 
-                task_available.wait(lock, [this] {return stopped || (!task_queue.empty() || force_exit);});
+                task_available.wait(lock, [this] {return stopped || (!task_queue.empty() && !paused) || force_exit;});
                 auto wait_end = chrono::steady_clock::now();
                 total_waiting_time_ms += chrono::duration_cast<chrono::milliseconds>(wait_end - wait_start).count();
                 ++waiting_entries;
@@ -281,10 +308,8 @@ void stop_after_duration(int seconds)
     this_thread::sleep_for(chrono::seconds(seconds));
     stop_simulation = true;
 }
-
 int main()
 {
-
     const int num_workers = 4;
     const int min_task_duration = 5;
     const int max_task_duration = 10;
@@ -298,6 +323,7 @@ int main()
     thread_pool.start(num_workers);
 
     atomic<bool> stop_task_generation(false);
+
     auto task_generator = [&]() {
         while (!stop_task_generation)
         {
@@ -316,6 +342,20 @@ int main()
     }
 
     thread timer_thread(stop_after_duration, simulation_seconds);
+
+    this_thread::sleep_for(chrono::seconds(7));
+    {
+        lock_guard<mutex> lock(cout_lock);
+        cout << "\n===> Pausing thread pool...\n";
+    }
+    thread_pool.pause();
+
+    this_thread::sleep_for(chrono::seconds(5));
+    {
+        lock_guard<mutex> lock(cout_lock);
+        cout << "\n===> Resuming thread pool...\n";
+    }
+    thread_pool.resume();
 
     while (!stop_simulation)
     {
